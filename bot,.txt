@@ -1,0 +1,458 @@
+import logging
+import os
+import signal
+from typing import Dict, List, Optional, Union
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import platform
+from dataclasses import asdict
+
+from telegram import Update, BotCommand
+from telegram.error import TimedOut, NetworkError
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    Application,
+)
+import ollama
+
+# Настройка логирования
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# Конфигурация
+class Config:
+    MAX_CONTEXT_LENGTH = 20
+    OLLAMA_MODEL = "Версия ИИ например = deepseek-r1:8b"
+    OLLAMA_TIMEOUT = 30  # seconds
+    MAX_WORKERS = 5
+    TELEGRAM_TIMEOUT = 10  # seconds for Telegram API
+    TELEGRAM_TOKEN = 'Телеграм токен'
+    MAX_MESSAGE_LENGTH = 4000  # Максимальная длина сообщения Telegram
+    MESSAGE_SPLIT_DELAY = 1.5  # Задержка между частями
+    RETRY_DELAY = 2.0  # Задержка при повторной попытке
+
+
+class TelegramBot:
+    def __init__(self):
+        self.last_error: Optional[str] = None
+        self.application: Optional[Application] = None
+        self.shutdown_event = asyncio.Event()
+        self.executor = ThreadPoolExecutor(max_workers=Config.MAX_WORKERS)
+        self.user_contexts: Dict[int, List[Dict[str, str]]] = {}
+        self.context_lock = asyncio.Lock()
+        self.initialized = False
+
+    async def post_init(self, application: Application) -> None:
+        """Инициализация команд бота после запуска"""
+        try:
+            # Список только тех команд, которые мы хотим видеть в меню
+            commands = [
+                BotCommand("start", "Начальное приветствие"),
+                BotCommand("pullmodel", "Информация о модели"),
+                BotCommand("clear", "Очистить контекст"),
+                BotCommand("health", "Проверка состояния бота"),
+                BotCommand("help", "Список всех команд")]
+            
+            # Устанавливаем только наши команды и удаляем все остальные
+            await application.bot.set_my_commands(commands)
+            self.initialized = True
+            logger.info("Bot initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize bot commands: {e}", exc_info=True)
+            raise
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработчик команды /start"""
+        try:
+            await update.message.reply_text(
+                "Привет! Я чат-бот. Чем могу помочь?"
+            )
+        except Exception as e:
+            logger.error(f"Error in start: {e}", exc_info=True)
+
+    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработчик команды /help"""
+        try:
+            help_text = (
+                "Вот список всех команд:\n"
+                "/start - Начальное приветствие\n"
+                "/pullmodel - Информация о модели\n"
+                "/clear - Очистить контекст\n"
+                "/health - Проверка состояния бота\n"
+                "/help - Список всех команд"
+            )
+            await update.message.reply_text(help_text)
+        except Exception as e:
+            logger.error(f"Error in help: {e}", exc_info=True)
+
+    async def health_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Проверка состояния бота (/health)"""
+        try:
+            # Проверяем доступность Ollama
+            ollama_status = "❌ Недоступен"
+            model_status = "❌ Не проверена"
+            model_details = ""
+
+            try:
+                # Проверяем доступность Ollama простым запросом
+                await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        self.executor, lambda: ollama.show(Config.OLLAMA_MODEL)
+                    ),
+                    timeout=5.0,
+                )
+                ollama_status = "✅ Доступен"
+                model_status = "✅ Найдена"
+                
+                # Получаем детали модели
+                model_info = await asyncio.get_event_loop().run_in_executor(
+                    self.executor, lambda: ollama.show(Config.OLLAMA_MODEL)
+                )
+                if isinstance(model_info, dict):
+                    model_details = f" (размер: {model_info.get('size', 'неизвестно')})"
+                elif hasattr(model_info, 'size'):
+                    model_details = f" (размер: {model_info.size})"
+                
+            except Exception as e:
+                # Если show не сработал, пробуем через list
+                try:
+                    models = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            self.executor, lambda: ollama.list()
+                        ),
+                        timeout=5.0,
+                    )
+                    
+                    ollama_status = "✅ Доступен"
+                    
+                    # Обрабатываем разные форматы ответа
+                    models_list = []
+                    if isinstance(models, dict) and 'models' in models:
+                        models_list = models['models']
+                    elif hasattr(models, 'models'):
+                        models_list = models.models
+                    
+                    # Ищем нашу модель
+                    for model in models_list:
+                        model_name = model.get('name') if isinstance(model, dict) else getattr(model, 'name', '')
+                        if model_name == Config.OLLAMA_MODEL:
+                            model_status = "✅ Найдена"
+                            if isinstance(model, dict):
+                                model_details = f" (размер: {model.get('size', 'неизвестно')})"
+                            elif hasattr(model, 'size'):
+                                model_details = f" (размер: {model.size})"
+                            break
+                    
+                    if model_status != "✅ Найдена":
+                        model_status = "❌ Не найдена"
+                        
+                except Exception as e:
+                    logger.error(f"Ollama health check failed: {e}", exc_info=True)
+                    self.last_error = str(e)
+
+            # Формируем сообщение о состоянии
+            status = (
+                "🔄 Статус бота:\n"
+                f"• Ollama: {ollama_status}\n"
+                f"• Модель: {Config.OLLAMA_MODEL}{model_details} - {model_status}\n"
+                f"• Активных диалогов: {len(self.user_contexts)}\n"
+                f"• Последняя ошибка: {self.last_error or 'Нет'}"
+            )
+
+            await update.message.reply_text(status)
+        except Exception as e:
+            logger.error(f"Health check error: {e}", exc_info=True)
+            await update.message.reply_text("❌ Ошибка при проверке состояния")
+
+    async def pull_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Информация о используемой модели (/pullmodel)"""
+        try:
+            await update.message.reply_text(f"Используемая модель: {Config.OLLAMA_MODEL}")
+        except Exception as e:
+            logger.error(f"Error in pullmodel: {e}", exc_info=True)
+
+    async def clear_context(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Очистка контекста пользователя (/clear)"""
+        user_id = update.effective_user.id
+        try:
+            async with self.context_lock:
+                if user_id in self.user_contexts:
+                    self.user_contexts[user_id] = []
+                    await update.message.reply_text("Контекст очищен!")
+                else:
+                    await update.message.reply_text("Контекст уже пуст!")
+        except Exception as e:
+            logger.error(f"Error clearing context: {e}", exc_info=True)
+            await update.message.reply_text("Ошибка при очистке контекста.")
+
+    def _get_ollama_response_sync(self, context: List[Dict[str, str]]) -> str:
+        """Синхронная версия для выполнения в ThreadPool"""
+        try:
+            response = ollama.chat(
+                model=Config.OLLAMA_MODEL,
+                messages=context,
+                options={"timeout": Config.OLLAMA_TIMEOUT * 1000},
+            )
+
+            # Логируем полный ответ для отладки
+            logger.debug(f"Ollama raw response: {response}")
+
+            # Извлекаем только текстовый ответ
+            if hasattr(response, 'message') and hasattr(response.message, 'content'):
+                return response.message.content
+            elif isinstance(response, dict) and 'message' in response:
+                if isinstance(response['message'], dict) and 'content' in response['message']:
+                    return response['message']['content']
+                elif hasattr(response['message'], 'content'):
+                    return response['message'].content
+            
+            # Если не удалось извлечь контент, возвращаем весь ответ как строку
+            return str(response)
+
+        except Exception as e:
+            logger.error(f"Ollama error: {e}", exc_info=True)
+            return "Ошибка при обработке запроса"
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка текстовых сообщений с разделением длинных ответов"""
+        user_id = update.effective_user.id
+        user_message = update.message.text
+
+        try:
+            # Добавление сообщения в контекст (без изменений)
+            async with self.context_lock:
+                if user_id not in self.user_contexts:
+                    self.user_contexts[user_id] = []
+                self.user_contexts[user_id].append({"role": "user", "content": user_message})
+                
+                if len(self.user_contexts[user_id]) > Config.MAX_CONTEXT_LENGTH:
+                    self.user_contexts[user_id] = self.user_contexts[user_id][-Config.MAX_CONTEXT_LENGTH:]
+
+            # Получение ответа от модели
+            response = await asyncio.get_event_loop().run_in_executor(
+                self.executor, self._get_ollama_response_sync, self.user_contexts[user_id].copy()
+            )
+
+            # Сохранение полного ответа в контексте
+            async with self.context_lock:
+                self.user_contexts[user_id].append({"role": "assistant", "content": response})
+
+            # Улучшенная логика разделения сообщений
+            max_length = Config.MAX_MESSAGE_LENGTH
+            if len(response) <= max_length:
+                await update.message.reply_text(response)
+                return
+
+            # Разбиваем сообщение на части
+            parts = []
+            current_part = ""
+            
+            # Сначала пробуем разбить по абзацам
+            paragraphs = response.split('\n\n')
+            for para in paragraphs:
+                if len(current_part) + len(para) + 2 > max_length:
+                    if current_part:
+                        parts.append(current_part.strip())
+                    current_part = para
+                else:
+                    if current_part:
+                        current_part += "\n\n" + para
+                    else:
+                        current_part = para
+            
+            if current_part:
+                parts.append(current_part.strip())
+            
+            # Если разбивка по абзацам не дала результата, разбиваем по предложениям
+            if len(parts) == 0 or any(len(p) > max_length for p in parts):
+                parts = []
+                current_part = ""
+                sentences = response.split('. ')
+                for sent in sentences:
+                    if len(current_part) + len(sent) + 2 > max_length:
+                        if current_part:
+                            parts.append(current_part.strip() + ".")
+                        current_part = sent
+                    else:
+                        if current_part:
+                            current_part += ". " + sent
+                        else:
+                            current_part = sent
+                if current_part:
+                    parts.append(current_part.strip())
+
+            # Если всё ещё есть длинные части, разбиваем принудительно
+            if any(len(p) > max_length for p in parts):
+                parts = [response[i:i+max_length] for i in range(0, len(response), max_length)]
+
+            # Отправка частей с обработкой ошибок
+            for i, part in enumerate(parts, 1):
+                try:
+                    prefix = f"📝 Часть {i}/{len(parts)}:\n" if len(parts) > 1 else ""
+                    await update.message.reply_text(prefix + part)
+                    
+                    # Увеличиваем задержку между сообщениями
+                    await asyncio.sleep(1.5)  # Увеличенная задержка
+                    
+                except Exception as e:
+                    logger.error(f"Error sending message part {i}: {e}")
+                    # Пробуем отправить ещё раз с меньшим размером
+                    try:
+                        chunk_size = 3000
+                        chunks = []
+                        for j in range(0, len(part), chunk_size):
+                            chunks.append(part[j:j+chunk_size])
+                        for chunk in chunks:
+                            await update.message.reply_text(chunk)
+                            await asyncio.sleep(1.5)
+                    except Exception as retry_error:
+                        logger.error(f"Retry failed: {retry_error}")
+                        await update.message.reply_text("❌ Не удалось отправить часть ответа")
+
+        except Exception as e:
+            logger.error(f"Error handling message: {e}", exc_info=True)
+            self.last_error = str(e)
+            await update.message.reply_text("⚠️ Произошла ошибка при обработке сообщения")
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Глобальный обработчик ошибок"""
+        error = context.error
+        logger.error(f"Error: {error}", exc_info=True)
+
+        if isinstance(update, Update) and update.message:
+            try:
+                self.last_error = str(error)
+                await update.message.reply_text("Произошла ошибка. Попробуйте еще раз.")
+            except Exception as e:
+                logger.error(f"Error in error handler: {e}", exc_info=True)
+
+    async def shutdown(self, signal=None) -> None:
+        """Очистка ресурсов при завершении"""
+        if signal:
+            logger.info(f"Received exit signal {signal.name}...")
+
+        logger.info("Shutting down...")
+        self.shutdown_event.set()
+
+        if self.application and self.initialized:
+            try:
+                await self.application.stop()
+                await self.application.shutdown()
+            except Exception as e:
+                logger.error(f"Error during shutdown: {e}", exc_info=True)
+
+        # Останавливаем пул потоков
+        self.executor.shutdown(wait=True)
+        logger.info("Bot stopped gracefully")
+
+    async def run(self) -> None:
+        """Основной цикл работы бота"""
+        max_retries = 3
+        retry_delay = 5  # seconds
+
+        try:
+            # Обработка сигналов завершения (только для Unix-систем)
+            if platform.system() != "Windows":
+                try:
+                    loop = asyncio.get_running_loop()
+                    for sig in (signal.SIGTERM, signal.SIGINT):
+                        loop.add_signal_handler(
+                            sig, lambda s=sig: asyncio.create_task(self.shutdown(s))
+                        )
+                except NotImplementedError:
+                    logger.warning("Signal handling not supported on this platform")
+
+            # Проверяем токен
+            if not Config.TELEGRAM_TOKEN:
+                raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set")
+
+            # Инициализация приложения с повторными попытками
+            for attempt in range(max_retries):
+                try:
+                    self.application = (
+                        ApplicationBuilder()
+                        .token(Config.TELEGRAM_TOKEN)
+                        .post_init(self.post_init)
+                        .concurrent_updates(True)
+                        .pool_timeout(30)
+                        .read_timeout(Config.TELEGRAM_TIMEOUT)
+                        .write_timeout(Config.TELEGRAM_TIMEOUT)
+                        .connect_timeout(Config.TELEGRAM_TIMEOUT)
+                        .build()
+                    )
+
+                    # Регистрация обработчиков
+                    handlers = [
+                        CommandHandler("start", self.start),
+                        CommandHandler("pullmodel", self.pull_model),
+                        CommandHandler("clear", self.clear_context),
+                        CommandHandler("health", self.health_check),
+                        CommandHandler("help", self.help),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message),
+                    ]
+                    for handler in handlers:
+                        self.application.add_handler(handler)
+
+                    self.application.add_error_handler(self.error_handler)
+
+                    # Запуск бота
+                    logger.info("Starting bot...")
+                    await self.application.initialize()
+                    await self.application.start()
+
+                    if hasattr(self.application, "updater") and self.application.updater:
+                        await self.application.updater.start_polling()
+                    else:
+                        logger.warning("Application has no updater set")
+
+                    logger.info("Bot started successfully")
+                    break
+
+                except (TimedOut, NetworkError) as e:
+                    logger.error(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    raise
+                except Exception as e:
+                    logger.error(f"Initialization failed: {e}", exc_info=True)
+                    raise
+
+            # Для Windows используем вечный цикл с обработкой KeyboardInterrupt
+            if platform.system() == "Windows":
+                try:
+                    while True:
+                        await asyncio.sleep(1)
+                except KeyboardInterrupt:
+                    await self.shutdown()
+            else:
+                await self.shutdown_event.wait()
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.critical(f"Application error: {e}", exc_info=True)
+        finally:
+            await self.shutdown()
+
+
+def main() -> None:
+    """Точка входа в приложение"""
+    bot = TelegramBot()
+    try:
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.critical(f"Unexpected error: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    main()
